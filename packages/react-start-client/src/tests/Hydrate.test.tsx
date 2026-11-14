@@ -225,6 +225,285 @@ describe('Hydrate', () => {
     }
   })
 
+  // React 19.3 double-invokes Effects in Strict Mode during hydration, so a
+  // hydrated boundary's effects are cleaned up and set up again before any
+  // interaction reaches it.
+  it('hydrates an interaction boundary inside a Strict Mode hydration root', async () => {
+    const { container, root } = await hydrateFromServer(
+      <React.StrictMode>
+        <Hydrate when={interaction()}>
+          <InteractiveChild />
+        </Hydrate>
+      </React.StrictMode>,
+    )
+
+    try {
+      expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+        'false',
+      )
+
+      await fireIntent(() => {
+        fireEvent.click(screen.getByTestId('child'))
+      })
+
+      await waitFor(() =>
+        expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+          'true',
+        ),
+      )
+    } finally {
+      await unmountHydratedRoot(root, container)
+    }
+  })
+
+  it('keeps procedural prefetch live inside a Strict Mode hydration root', async () => {
+    const signals: Array<AbortSignal> = []
+    const waitReasons: Array<string> = []
+    const neverPrefetches = {
+      _t: 'idle',
+      _s: () => () => {},
+    } as HydrationPrefetchStrategy<'idle'>
+    let resolvePrefetch!: () => void
+    const prefetchBlocker = new Promise<void>((resolve) => {
+      resolvePrefetch = resolve
+    })
+
+    const { container, root } = await hydrateFromServer(
+      <React.StrictMode>
+        <Hydrate
+          when={interaction()}
+          prefetch={async ({ signal, waitFor }) => {
+            signals.push(signal)
+            waitReasons.push(await waitFor(neverPrefetches))
+            await prefetchBlocker
+          }}
+        >
+          <InteractiveChild />
+        </Hydrate>
+      </React.StrictMode>,
+    )
+
+    try {
+      await fireIntent(() => {
+        fireEvent.click(screen.getByTestId('child'))
+      })
+
+      await waitFor(() => expect(waitReasons).toEqual(['hydrate']))
+      expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+        'false',
+      )
+
+      await act(async () => {
+        resolvePrefetch()
+        await prefetchBlocker
+        await Promise.resolve()
+      })
+
+      await waitFor(() =>
+        expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+          'true',
+        ),
+      )
+      expect(signals.map((signal) => signal.aborted)).toEqual([false])
+    } finally {
+      await unmountHydratedRoot(root, container)
+    }
+  })
+
+  it('prefetches once with a prefetch strategy inside a Strict Mode hydration root', async () => {
+    const preload = vi.fn(() => Promise.resolve())
+
+    const { container, root } = await hydrateFromServer(
+      <React.StrictMode>
+        <InternalHydrate
+          when={interaction()}
+          prefetch={idle({ timeout: 1 })}
+          p={preload}
+        >
+          <InteractiveChild />
+        </InternalHydrate>
+      </React.StrictMode>,
+    )
+
+    try {
+      await waitFor(() => expect(preload).toHaveBeenCalledTimes(1))
+      expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+        'false',
+      )
+
+      await fireIntent(() => {
+        fireEvent.click(screen.getByTestId('child'))
+      })
+
+      await waitFor(() =>
+        expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+          'true',
+        ),
+      )
+      expect(preload).toHaveBeenCalledTimes(1)
+    } finally {
+      await unmountHydratedRoot(root, container)
+    }
+  })
+
+  it('replays intent captured before a Strict Mode hydration root hydrates', async () => {
+    const app = (
+      <React.StrictMode>
+        <Hydrate when={interaction()}>
+          <InteractiveChild />
+        </Hydrate>
+      </React.StrictMode>
+    )
+
+    vi.stubGlobal('window', undefined)
+    const html = renderToString(app)
+    vi.unstubAllGlobals()
+
+    const container = document.createElement('div')
+    document.body.append(container)
+    container.innerHTML = html
+
+    container
+      .querySelector('[data-testid="child"]')!
+      .dispatchEvent(
+        new MouseEvent('click', { bubbles: true, cancelable: true }),
+      )
+
+    let root!: ReturnType<typeof hydrateRoot>
+    try {
+      await act(async () => {
+        root = hydrateRoot(container, app)
+        await Promise.resolve()
+      })
+
+      await waitFor(() =>
+        expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+          'true',
+        ),
+      )
+      await waitFor(() =>
+        expect(screen.getByTestId('child').textContent).toBe('1'),
+      )
+    } finally {
+      await unmountHydratedRoot(root, container)
+    }
+  })
+
+  it('keeps server HTML when an ancestor Suspense re-suspends and reveals the boundary', async () => {
+    let setStep!: (step: number) => void
+    let resolveData!: () => void
+    let dataReady = false
+    const data = new Promise<void>((resolve) => {
+      resolveData = () => {
+        dataReady = true
+        resolve()
+      }
+    })
+
+    function SuspendOnStep(props: { step: number }) {
+      if (props.step === 1 && !dataReady) {
+        throw data
+      }
+      return null
+    }
+
+    function App() {
+      const [step, setStepState] = React.useState(0)
+      setStep = setStepState
+      return (
+        <React.Suspense fallback={<p>loading</p>}>
+          <SuspendOnStep step={step} />
+          <Hydrate when={interaction()}>
+            <InteractiveChild />
+          </Hydrate>
+        </React.Suspense>
+      )
+    }
+
+    const { container, root } = await hydrateFromServer(<App />)
+
+    try {
+      await act(() => {
+        setStep(1)
+      })
+      await act(async () => {
+        resolveData()
+        await data
+      })
+
+      expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+        'false',
+      )
+
+      await fireIntent(() => {
+        fireEvent.click(getMarker())
+      })
+
+      await waitFor(() =>
+        expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+          'true',
+        ),
+      )
+    } finally {
+      await unmountHydratedRoot(root, container)
+    }
+  })
+
+  it('hydrates on interaction and restarts prefetch after an Activity is hidden and shown', async () => {
+    let setMode!: (mode: 'visible' | 'hidden') => void
+    const signals: Array<AbortSignal> = []
+    const waitReasons: Array<string> = []
+    const neverPrefetches = {
+      _t: 'idle',
+      _s: () => () => {},
+    } as HydrationPrefetchStrategy<'idle'>
+
+    function App() {
+      const [mode, setModeState] = React.useState<'visible' | 'hidden'>(
+        'visible',
+      )
+      setMode = setModeState
+      return (
+        <React.Activity mode={mode}>
+          <Hydrate
+            when={interaction()}
+            prefetch={async ({ signal, waitFor }) => {
+              signals.push(signal)
+              waitReasons.push(await waitFor(neverPrefetches))
+            }}
+          >
+            <InteractiveChild />
+          </Hydrate>
+        </React.Activity>
+      )
+    }
+
+    const { container, root } = await hydrateFromServer(<App />)
+
+    try {
+      await act(() => {
+        setMode('hidden')
+      })
+      await act(() => {
+        setMode('visible')
+      })
+
+      await fireIntent(() => {
+        fireEvent.click(getMarker())
+      })
+
+      await waitFor(() =>
+        expect(screen.getByTestId('child').getAttribute('data-hydrated')).toBe(
+          'true',
+        ),
+      )
+      expect(signals.map((signal) => signal.aborted)).toEqual([true, false])
+      expect(waitReasons).toEqual(['abort', 'hydrate'])
+    } finally {
+      await unmountHydratedRoot(root, container)
+    }
+  })
+
   it('omits never content when mounted after the app is already hydrated', async () => {
     await renderAsync(
       <Hydrate when={never()}>

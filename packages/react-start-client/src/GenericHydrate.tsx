@@ -14,6 +14,7 @@ import {
   getOrCreateGate,
   onGateResolve,
   releaseGate,
+  retainGate,
   runHydrationStrategyCleanup,
   saveFallbackHtml,
   waitForHydrationPrefetchStrategy,
@@ -29,13 +30,11 @@ import type { HydrateProps, InternalHydrateProps } from './Hydrate'
 
 type Gate = HydrationGateRecord & { promise: Promise<void> }
 type PrefetchController = {
-  abortController: AbortController
+  signal: AbortSignal
   hydrationRequested: boolean
   hydrationListeners: Set<() => void>
   hydrationResolvePending: boolean
-  started: boolean
-  promise?: Promise<void>
-  cleanup?: () => void
+  promise: Promise<void>
 }
 
 const dynamicType = 'dynamic'
@@ -94,14 +93,6 @@ function useHydrationGate(props: InternalHydrateProps) {
     undefined,
   )
 
-  prefetchControllerRef.current ??= {
-    abortController: new AbortController(),
-    hydrationRequested: false,
-    hydrationListeners: new Set<() => void>(),
-    hydrationResolvePending: false,
-    started: false,
-  }
-
   shouldPreserveServerHTMLRef.current ??=
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     (isServer ?? typeof window === 'undefined') || !hydrated
@@ -131,43 +122,61 @@ function useHydrationGate(props: InternalHydrateProps) {
   const markerRef = React.useCallback(
     (element: HTMLDivElement | null) => {
       markerElementRef.current = element
-      if (element) {
-        if (
-          hydrateStrategy._t === 'never' &&
-          !shouldPreserveServerHTMLRef.current
-        ) {
-          element.replaceChildren()
-        }
-        saveFallbackHtml(id, element)
+      if (
+        element &&
+        hydrateStrategy._t === 'never' &&
+        !shouldPreserveServerHTMLRef.current
+      ) {
+        element.replaceChildren()
       }
     },
-    [hydrateStrategy._t, id],
+    [hydrateStrategy._t],
   )
 
-  React.useEffect(() => {
+  // Strict Mode and Activity can clean up and set up these effects again on
+  // the same instance, so each setup re-establishes what its cleanup removes.
+  useLayoutEffect(() => {
     const gate = gateRef.current!
-    return () => {
-      const controller = prefetchControllerRef.current
-      controller?.abortController.abort()
-      controller?.cleanup?.()
-      controller?.hydrationListeners.clear()
-      releaseGate(gate)
-    }
+    retainGate(gate)
+    return () => releaseGate(gate)
+  }, [])
+
+  // Passive, unlike the gate: an ancestor Suspense hiding this boundary only
+  // disconnects layout effects, and the server HTML must survive that.
+  React.useEffect(() => {
+    const element = markerElementRef.current
+    return element ? saveFallbackHtml(gateRef.current!.id, element) : undefined
   }, [])
 
   React.useEffect(() => {
+    const prefetchInput = latestRef.current.prefetch
     if (
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
       (isServer ?? typeof window === 'undefined') ||
-      !latestRef.current.prefetch
+      !prefetchInput
     ) {
       return
     }
 
-    const controller = prefetchControllerRef.current!
-    if (controller.started) return
-    controller.started = true
+    const preload = () => latestRef.current.preload?.() ?? Promise.resolve()
 
+    if (typeof prefetchInput !== 'function') {
+      if (!latestRef.current.preload) return
+
+      return runHydrationStrategyCleanup(
+        prefetchInput._s?.({
+          element: markerElementRef.current,
+          prefetch: () => {
+            if (didPrefetchRef.current) return
+            didPrefetchRef.current = true
+            void preload()
+          },
+        }),
+      )
+    }
+
+    const abortController = new AbortController()
+    const signal = abortController.signal
     const onHydrate = (listener: () => void) => {
       if (controller.hydrationRequested) {
         listener()
@@ -180,50 +189,38 @@ function useHydrationGate(props: InternalHydrateProps) {
       }
     }
 
-    const preload = () => latestRef.current.preload?.() ?? Promise.resolve()
-    const prefetchInput = latestRef.current.prefetch
-
-    if (typeof prefetchInput === 'function') {
-      const promise = Promise.resolve()
-        .then(() =>
-          prefetchInput({
-            element: markerElementRef.current,
-            signal: controller.abortController.signal,
-            preload,
-            waitFor: (strategy) =>
-              waitForHydrationPrefetchStrategy(strategy, {
-                element: markerElementRef.current,
-                signal: controller.abortController.signal,
-                onHydrate,
-              }),
-          }),
-        )
-        .then(() => undefined)
-
-      controller.promise = promise
-      promise.catch((error) => {
-        if (!controller.abortController.signal.aborted) {
-          setPrefetchError(error)
-        }
-      })
-      return
-    }
-
-    if (!latestRef.current.preload) return
-
-    const prefetch = () => {
-      if (didPrefetchRef.current) return
-      didPrefetchRef.current = true
-      void preload()
-    }
-
-    controller.cleanup = runHydrationStrategyCleanup(
-      prefetchInput._s?.({
-        element: markerElementRef.current,
-        prefetch,
+    const controller: PrefetchController = {
+      signal,
+      hydrationRequested: false,
+      hydrationListeners: new Set<() => void>(),
+      hydrationResolvePending: false,
+      // A run cleaned up before it starts, as Strict Mode does, never calls
+      // the prefetch function.
+      promise: Promise.resolve().then(async () => {
+        if (signal.aborted) return
+        await prefetchInput({
+          element: markerElementRef.current,
+          signal,
+          preload,
+          waitFor: (strategy) =>
+            waitForHydrationPrefetchStrategy(strategy, {
+              element: markerElementRef.current,
+              signal,
+              onHydrate,
+            }),
+        })
       }),
-    )
-  }, [hydrateStrategy, latestRef])
+    }
+    prefetchControllerRef.current = controller
+    controller.promise.catch((error) => {
+      if (!signal.aborted) {
+        setPrefetchError(error)
+      }
+    })
+
+    // Aborting settles every pending `waitFor`, which removes its listener.
+    return () => abortController.abort()
+  }, [latestRef])
 
   useLayoutEffect(() => {
     const gate = gateRef.current!
@@ -263,24 +260,24 @@ function useHydrationGate(props: InternalHydrateProps) {
     }
 
     const requestHydration = () => {
-      const controller = prefetchControllerRef.current!
+      const controller = prefetchControllerRef.current
+      if (!controller) {
+        resolveGate()
+        return
+      }
       if (!controller.hydrationRequested) {
         controller.hydrationRequested = true
         controller.hydrationListeners.forEach((listener) => listener())
         controller.hydrationListeners.clear()
       }
 
-      if (!controller.promise) {
-        resolveGate()
-        return
-      }
       if (controller.hydrationResolvePending) return
       controller.hydrationResolvePending = true
 
       controller.promise.then(
         () => resolveGate(),
         (error) => {
-          if (!controller.abortController.signal.aborted) {
+          if (!controller.signal.aborted) {
             setPrefetchError(error)
           }
         },

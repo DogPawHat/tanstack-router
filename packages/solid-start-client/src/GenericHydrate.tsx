@@ -13,6 +13,7 @@ import {
   getOrCreateGate,
   onGateResolve,
   releaseGate,
+  retainGate,
   runHydrationStrategyCleanup,
   saveFallbackHtml,
   waitForHydrationPrefetchStrategy,
@@ -165,12 +166,13 @@ export function GenericHydrate(props: InternalHydrateProps) {
   const resolveGate = gate.resolve
 
   Solid.onMount(() => {
+    retainGate(gate)
     const currentHydrateStrategy = initialHydrateStrategy
     const currentPrefetchStrategy = prefetchStrategy()
     const currentHydrateType = currentHydrateStrategy._t!
     gate.when = currentHydrateType
     if (markerElement) {
-      saveFallbackHtml(id, markerElement)
+      Solid.onCleanup(saveFallbackHtml(id, markerElement))
     }
 
     if (

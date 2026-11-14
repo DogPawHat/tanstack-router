@@ -35,13 +35,17 @@ export function createResolvedGate(
   }
 }
 
+/**
+ * Returns the registered gate for `id`, or a new unregistered gate, without
+ * side effects so it can run during render. Callers register the gate with
+ * `retainGate` once mounted and pair that with `releaseGate`.
+ */
 export function getOrCreateGate(
   id: string,
   when: HydrationWhen,
 ): HydrationGateRecord {
   const existing = gateRegistry.get(id)
   if (existing?.when === when) {
-    existing.consumers++
     return existing
   }
 
@@ -54,7 +58,7 @@ export function getOrCreateGate(
     id,
     promise,
     resolved: false,
-    consumers: 1,
+    consumers: 0,
     when,
     resolveListeners: new Set(),
     resolve: () => {
@@ -66,12 +70,16 @@ export function getOrCreateGate(
     },
   }
 
-  gateRegistry.set(id, gate)
-  if (when !== 'never' && resolvedGateIds.has(id)) {
-    resolvedGateIds.delete(id)
+  return gate
+}
+
+export function retainGate(gate: HydrationGateRecord) {
+  gate.consumers++
+  gateRegistry.set(gate.id, gate)
+  // Intent recorded while no gate was registered for this id opens it now.
+  if (resolvedGateIds.delete(gate.id) && gate.when !== 'never') {
     gate.resolve()
   }
-  return gate
 }
 
 export function releaseGate(gate: HydrationGateRecord) {
@@ -80,7 +88,6 @@ export function releaseGate(gate: HydrationGateRecord) {
   if (gate.consumers > 0) return
   if (gateRegistry.get(gate.id) === gate) {
     gateRegistry.delete(gate.id)
-    fallbackHtmlByGateId.delete(gate.id)
     gate.resolveListeners.clear()
   }
 }
@@ -182,9 +189,18 @@ export function clearResolvedGateIdsInMarker(marker: Element) {
   })
 }
 
+/**
+ * Snapshots the boundary's server HTML once per id and returns a function that
+ * forgets it. The snapshot must outlive layout-only disconnects (an ancestor
+ * Suspense hiding the boundary), so callers forget it on unmount, not when
+ * the gate is released.
+ */
 export function saveFallbackHtml(id: string, element: Element) {
   if (!fallbackHtmlByGateId.has(id)) {
     fallbackHtmlByGateId.set(id, element.innerHTML)
+  }
+  return () => {
+    fallbackHtmlByGateId.delete(id)
   }
 }
 

@@ -23,6 +23,7 @@ export {
   onGateResolve,
   releaseGate,
   resolveHydrationMarker,
+  retainGate,
   runHydrationStrategyCleanup,
   saveFallbackHtml,
   waitForHydrationPrefetchStrategy,
